@@ -286,6 +286,13 @@ input[type=range]{flex:1;min-width:140px}
 .controls{margin-top:1rem}
 h3{font-size:.9rem;color:#c8d3df;margin:1rem 0 .3rem}
 #msg{color:#9aa7b5;font-size:.85rem}
+.presetbar{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+button.preset{background:#1a222d;color:#c8d3df;border:1px solid #2b3644}
+button.preset:hover{background:#232f3d}
+button.preset.active{background:#7a2c5e;color:#ffd7ef;border-color:#a8458a}
+.tabs{display:flex;gap:.5rem;margin:1rem 0 .6rem}
+button.tab{background:transparent;color:#9aa7b5;border:1px solid #2b3644}
+button.tab.active{background:#1d6fd1;color:#fff;border-color:#1d6fd1}
 """
 
 PAGE = """<!doctype html><meta charset=utf-8>
@@ -309,21 +316,46 @@ PAGE = """<!doctype html><meta charset=utf-8>
   <div class=cap id=viewcap>&hellip;</div>
  </div>
 </div>
-<div class="card controls">
- <div class=row>
-  <button onclick="fresh()">Fresh snapshot (live capture)</button>
+<div class="card" style="margin-top:1rem">
+ <div class=presetbar>
+  <b style="color:#c8d3df">Presets</b>
+  <button class=preset data-preset=night onclick="applyPreset('night')">Night</button>
+  <button class=preset data-preset=day onclick="applyPreset('day')">Day</button>
+  <button class=preset data-preset=dawn onclick="applyPreset('dawn')">Dawn</button>
+  <button class=preset data-preset=dusk onclick="applyPreset('dusk')">Dusk</button>
+  <button class=preset data-preset=llama onclick="applyPreset('llama')">&#129433; Llama Search</button>
+  <span style="flex:1"></span>
+  <button onclick="fresh()">Fresh snapshot</button>
   <button class=ghost onclick="clip()">Record 10s MP4</button>
   <span id=msg></span>
  </div>
+</div>
+<div class=tabs>
+ <button class="tab active" id=tabbtn-view onclick="showTab('view')">View</button>
+ <button class=tab id=tabbtn-adv onclick="showTab('adv')">Advanced</button>
+</div>
+<div id=tab-view></div>
+<div id=tab-adv style="display:none">
+<div class="card controls">
  <h3>Pan / tilt / zoom (camera)</h3>
  <div class=row><label>Pan</label><input type=range id=pan min=-36 max=36 step=1 value=0 oninput="ptz()"><span class=val id=panv>0&deg;</span></div>
  <div class=row><label>Tilt</label><input type=range id=tilt min=-36 max=36 step=1 value=0 oninput="ptz()"><span class=val id=tiltv>0&deg;</span></div>
  <div class=row><label>Zoom</label><input type=range id=zoom min=100 max=500 step=5 value=100 oninput="ptz()"><span class=val id=zoomv>1.0&times;</span></div>
  <h3>Effects (applied to the served frame, never to the camera)</h3>
- <div class=row><label>Brightness</label><input type=range id=b min=-0.5 max=0.5 step=0.02 value=0 oninput="snap()"></div>
- <div class=row><label>Contrast</label><input type=range id=c min=0.4 max=1.8 step=0.02 value=1 oninput="snap()"></div>
- <div class=row><label>Gamma</label><input type=range id=g min=0.4 max=2.5 step=0.05 value=1 oninput="snap()"></div>
- <div class=row><label>Levels in</label><input type=range id=il min=0 max=0.6 step=0.01 value=0 oninput="snap()"> <input type=range id=ih min=0.4 max=1 step=0.01 value=1 oninput="snap()"></div>
+ <div class=row><label>Brightness</label><input type=range id=b min=-0.5 max=0.5 step=0.02 value=0 oninput="manualFx()"></div>
+ <div class=row><label>Contrast</label><input type=range id=c min=0.4 max=1.8 step=0.02 value=1 oninput="manualFx()"></div>
+ <div class=row><label>Gamma</label><input type=range id=g min=0.4 max=2.5 step=0.05 value=1 oninput="manualFx()"></div>
+ <div class=row><label>Saturation</label><input type=range id=sat min=0 max=3 step=0.05 value=1 oninput="manualFx()"></div>
+ <div class=row><label>Levels in</label><input type=range id=il min=0 max=0.6 step=0.01 value=0 oninput="manualFx()"> <input type=range id=ih min=0.4 max=1 step=0.01 value=1 oninput="manualFx()"></div>
+ <h3>Sensor (changes what the camera itself produces)</h3>
+ <div class=row><label>Brightness</label><input type=range id=sb min=0 max=255 step=1 value=128></div>
+ <div class=row><label>Contrast</label><input type=range id=sc min=0 max=255 step=1 value=128></div>
+ <div class=row><label>Saturation</label><input type=range id=ssat min=0 max=255 step=1 value=128></div>
+ <div class=row><label>Gain</label><input type=range id=sgain min=0 max=255 step=1 value=128></div>
+ <div class=row><label>Sharpness</label><input type=range id=ssharp min=0 max=255 step=1 value=128></div>
+ <div class=row><button class=ghost onclick="applySensor()">Apply sensor</button>
+ <button class=ghost onclick="resetSensor()">Sensor defaults</button><span id=smsg></span></div>
+</div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -331,10 +363,42 @@ const fmtT=ts=>ts?new Date(ts*1000).toLocaleTimeString():'-';
 const fmtAge=s=>s==null?'-':(s<90?Math.round(s)+'s ago':Math.round(s/60)+'m ago');
 function fx(){{const p=new URLSearchParams();
  if($('b').value!=0)p.set('b',$('b').value); if($('c').value!=1)p.set('c',$('c').value);
- if($('g').value!=1)p.set('g',$('g').value);
+ if($('g').value!=1)p.set('g',$('g').value); if($('sat').value!=1)p.set('sat',$('sat').value);
  if($('il').value!=0)p.set('il',$('il').value); if($('ih').value!=1)p.set('ih',$('ih').value);
  return p.toString();}}
-function snap(){{$('view').src='/snapshot.jpg?'+fx()+'&t='+Date.now();}}
+function snap(){{const f=fx();
+ $('view').src='/snapshot.jpg?'+f+'&t='+Date.now();
+ $('ref').src='/reference.jpg?'+f+'&t='+Date.now();}}
+function manualFx(){{document.querySelectorAll('button.preset').forEach(x=>x.classList.remove('active'));snap();}}
+const PRESETS={{
+ night:{{b:0.25,c:1.10,g:2.20,sat:1.00,il:0.00,ih:0.75}},
+ day:{{b:0.00,c:1.05,g:1.00,sat:1.00,il:0.00,ih:1.00}},
+ dawn:{{b:0.10,c:1.15,g:1.50,sat:1.25,il:0.00,ih:0.90}},
+ dusk:{{b:0.15,c:1.10,g:1.70,sat:1.15,il:0.00,ih:0.85}},
+ llama:{{b:0.30,c:1.35,g:2.40,sat:1.50,il:0.02,ih:0.80}}}};
+function applyPreset(name){{const p=PRESETS[name];if(!p)return;
+ $('b').value=p.b;$('c').value=p.c;$('g').value=p.g;$('sat').value=p.sat;
+ $('il').value=p.il;$('ih').value=p.ih;
+ document.querySelectorAll('button.preset').forEach(x=>x.classList.toggle('active',x.dataset.preset===name));
+ snap();}}
+function showTab(which){{const adv=which==='adv';
+ $('tab-adv').style.display=adv?'':'none';
+ $('tabbtn-view').classList.toggle('active',!adv);
+ $('tabbtn-adv').classList.toggle('active',adv);
+ if(adv)loadSensor();}}
+let sensorLoaded=false;
+async function loadSensor(){{if(sensorLoaded)return;sensorLoaded=true;
+ try{{const v=await (await fetch('/api/controls')).json();
+  if(v.brightness!=null)$('sb').value=v.brightness; if(v.contrast!=null)$('sc').value=v.contrast;
+  if(v.saturation!=null)$('ssat').value=v.saturation; if(v.gain!=null)$('sgain').value=v.gain;
+  if(v.sharpness!=null)$('ssharp').value=v.sharpness;}}catch(e){{}}}}
+function postSensor(vals){{return fetch('/api/sensor',{{method:'POST',
+ headers:{{'Content-Type':'application/json'}},body:JSON.stringify(vals)}});}}
+function applySensor(){{postSensor({{brightness:+$('sb').value,contrast:+$('sc').value,
+ saturation:+$('ssat').value,gain:+$('sgain').value,sharpness:+$('ssharp').value}})
+ .then(r=>r.json()).then(j=>{{$('smsg').textContent=j.ok?'sensor applied':'sensor failed';}});}}
+function resetSensor(){{$('sb').value=128;$('sc').value=128;$('ssat').value=128;
+ $('sgain').value=128;$('ssharp').value=128;applySensor();}}
 function fresh(){{$('msg').textContent='capturing...';
  const img=new Image();
  img.onload=()=>{{$('view').src=img.src;$('msg').textContent='fresh frame loaded';}};
@@ -364,7 +428,7 @@ async function tick(){{
    $('refcap').innerHTML='captured <b>'+fmtT(s.reference_ts)+'</b> &middot; '+
      fmtAge(s.reference_age_s)+' &middot; '+s.novel_count+' novel frames so far';
    if(s.reference_ts!==lastRefTs){{lastRefTs=s.reference_ts;
-     $('ref').src='/reference.jpg?t='+Date.now();}}
+     $('ref').src='/reference.jpg?'+fx()+'&t='+Date.now();}}
   }}
  }}catch(e){{ $('livepill').textContent='agent unreachable'; $('livepill').className='pill stale'; }}
  snap();
