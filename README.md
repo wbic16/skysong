@@ -51,3 +51,32 @@ Lessons, learned the honest way:
   view it from another machine — the shape the real posts will use.
 - Motion/event capture on the stills path (trail-cam pattern).
 - When the first Reolink post is built, this repo gets its post-agent.
+
+## The camera service (2026-11-15)
+
+Every camera host runs the same agent: `agent/skysong-agent.py`
+(Python stdlib only; needs `fswebcam`, `ffmpeg`, `v4l2-ctl` on the host).
+
+- **Port: 8642** — the same on every camera host. The agent binds
+  127.0.0.1 and the node's tailnet IP only (never the LAN/Wi-Fi side),
+  and each node also serves it over HTTPS via Tailscale Serve
+  (e.g. https://ni-knight.pizzly-halfmoon.ts.net/).
+- `GET /` — this camera's portal: view, PTZ sliders, effect sliders,
+  snapshot + MP4 buttons.
+- `GET /grid` — the grid portal: one tile per registered camera
+  (`agent/cameras.json`), snapshots refreshing every 15 s, each tile
+  linking to that camera's own portal. Every agent serves the grid;
+  adding a camera = install the agent on its host + add one registry line.
+- `GET /snapshot.jpg` — one still, with optional effect params
+  (`b` brightness, `c` contrast, `g` gamma, `sat`, `il`/`ih` input levels).
+- `GET /clip.mp4?seconds=N` — an N-second MP4 (1080p), same effect params.
+- `GET /api/controls`, `POST /api/ptz` — the camera's UVC controls.
+  The BRIO exposes pan/tilt (±36°) and zoom (100–500 = 1–5×) natively.
+  Known wrinkle: a combined pan+tilt+zoom set saw pan read back as 0
+  while tilt and zoom held — under investigation, service-side sets are
+  accepted.
+- `POST /api/sensor` — sensor-level brightness/contrast/saturation/gain/
+  sharpness, distinct from the per-request effects above.
+
+Install on a camera host: `deploy/install-agent.sh` (systemd unit
+included; the service user joins the `video` group).
