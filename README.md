@@ -80,3 +80,20 @@ Every camera host runs the same agent: `agent/skysong-agent.py`
 
 Install on a camera host: `deploy/install-agent.sh` (systemd unit
 included; the service user joins the `video` group).
+
+## Agent v2 — cache, novelty, UI (2026-11-15)
+
+- Background capture loop (15 s) keeps a cached latest frame on disk;
+  /snapshot.jpg serves the cache instantly (~55 ms vs ~10 s live);
+  ?fresh=1 forces a live capture.
+- Novelty first: each frame gets a 32x18 grayscale signature scored
+  against a persisted baseline (EMA of non-novel frames). A frame at
+  or above the threshold (10/255) is novel and becomes the reference
+  image at /reference.jpg — always the most recent non-baseline frame.
+  /api/status reports ages, scores, and recent novel events.
+- Portal UI rebuilt: reference image and live cached view side by
+  side, status pills, auto-refresh; grid tiles show per-camera status.
+- Verified live on ni-knight: baseline noise score ~3-4 in the dark
+  room; a sensor gain/brightness stimulus scored 67.6 and promoted
+  the reference. In near-darkness pixel novelty is weak by physics —
+  the decisive test is a light change.

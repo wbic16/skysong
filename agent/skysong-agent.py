@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
-"""skysong-agent - one agent per camera host. Same interface on every camera.
+"""skysong-agent v2 - one agent per camera host. Same interface on every camera.
 
 Endpoints (default port 8642, bound to 127.0.0.1 + the node's tailnet IP):
   GET  /                     this camera's portal page
   GET  /grid                 grid portal of all registered cameras
-  GET  /snapshot.jpg         one still (fswebcam, exposure warm-up)
+  GET  /snapshot.jpg         the cached latest frame (instant); ?fresh=1
+                             forces a live capture; effect params apply
+                             to whichever frame is served
+  GET  /reference.jpg        the most recent NOVEL frame - the latest
+                             capture that differs from the baseline scene
   GET  /clip.mp4?seconds=N   an N-second MP4 (default 10, max 120)
   GET  /api/info             node, device, camera name
+  GET  /api/status           cache + novelty state (ages, scores, counts)
   GET  /api/controls         current V4L2 control values
   POST /api/ptz              {pan_deg, tilt_deg, zoom}   (UVC ePTZ)
   POST /api/sensor           {brightness, contrast, saturation, gain, sharpness}
+
+Screenshot cache + novelty (the service's memory):
+  A background loop captures a frame every SKYSONG_CACHE_SECONDS (15).
+  Each frame gets a tiny grayscale signature; a running baseline (an
+  exponential average of non-novel signatures, persisted to disk) is
+  the scene the camera usually sees. A frame whose mean absolute
+  difference from baseline reaches SKYSONG_NOVELTY_THRESHOLD (10/255)
+  is NOVEL: it becomes the reference image. Novelty is the priority -
+  the reference image is always the most recent non-baseline frame,
+  and /snapshot.jpg serves the cache so a recent image is instant.
 
 Image effects on snapshot/clip (query params, all optional):
   b   brightness  -1.0..1.0   (ffmpeg eq)
@@ -21,12 +36,12 @@ Image effects on snapshot/clip (query params, all optional):
 
 Sensor-level brightness/contrast/etc. live under /api/sensor and change
 what the camera itself produces; the query-param effects are applied to
-the captured frame/clip and never touch the camera.
+the served frame and never touch the camera.
 
 Registry for /grid: cameras.json next to this file or at
 /etc/skysong/cameras.json - a list of {"name", "url"} entries.
 """
-import argparse, json, os, subprocess, sys, tempfile, threading
+import argparse, json, os, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -34,7 +49,13 @@ DEVICE = os.environ.get("SKYSONG_DEVICE", "/dev/video0")
 SNAP_RES = os.environ.get("SKYSONG_SNAP_RES", "3840x2160")
 CLIP_RES = os.environ.get("SKYSONG_CLIP_RES", "1920x1080")
 SNAP_SKIP = int(os.environ.get("SKYSONG_SNAP_SKIP", "90"))
+CACHE_RES = os.environ.get("SKYSONG_CACHE_RES", "1280x720")
+CACHE_SKIP = int(os.environ.get("SKYSONG_CACHE_SKIP", "30"))
+CACHE_SECONDS = float(os.environ.get("SKYSONG_CACHE_SECONDS", "15"))
+NOVELTY_THRESHOLD = float(os.environ.get("SKYSONG_NOVELTY_THRESHOLD", "10"))
+SIG_W, SIG_H = 32, 18
 HERE = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(HERE, "cache")
 LOCK = threading.Lock()
 
 PTZ = {"pan_absolute": (-36000, 36000), "tilt_absolute": (-36000, 36000),
@@ -92,8 +113,8 @@ def fx_filter(q):
     return ",".join(parts) if parts else None
 
 
-def capture_raw(path):
-    r = run(["fswebcam", "-d", DEVICE, "-r", SNAP_RES, "--skip", str(SNAP_SKIP),
+def capture_raw(path, res=SNAP_RES, skip=SNAP_SKIP):
+    r = run(["fswebcam", "-d", DEVICE, "-r", res, "--skip", str(skip),
              "--jpeg", "92", "--no-banner", path], 120)
     return r.returncode == 0 and os.path.exists(path)
 
@@ -109,6 +130,123 @@ def apply_fx(src, dst, vf, is_video=False):
     return run(cmd, 300).returncode == 0 and os.path.exists(dst)
 
 
+def signature(path):
+    """Tiny grayscale signature of a frame: SIG_W*SIG_H bytes, or None."""
+    r = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", path,
+                        "-vf", f"scale={SIG_W}:{SIG_H},format=gray",
+                        "-f", "rawvideo", "-"],
+                       capture_output=True, timeout=60)
+    if r.returncode == 0 and len(r.stdout) == SIG_W * SIG_H:
+        return r.stdout
+    return None
+
+
+class FrameCache:
+    """Latest frame + baseline + the most recent novel (reference) frame."""
+
+    def __init__(self):
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        self.latest = os.path.join(CACHE_DIR, "latest.jpg")
+        self.reference = os.path.join(CACHE_DIR, "reference.jpg")
+        self.baseline_file = os.path.join(CACHE_DIR, "baseline.raw")
+        self.lock = threading.Lock()
+        self.baseline = None          # list of floats, len SIG_W*SIG_H
+        self.latest_ts = 0.0
+        self.reference_ts = 0.0
+        self.last_score = None
+        self.captures = 0
+        self.novel_count = 0
+        self.events = []              # recent novel events {ts, score}
+        if os.path.exists(self.baseline_file):
+            raw = open(self.baseline_file, "rb").read()
+            if len(raw) == SIG_W * SIG_H:
+                self.baseline = [float(b) for b in raw]
+        if os.path.exists(self.reference):
+            self.reference_ts = os.path.getmtime(self.reference)
+        if os.path.exists(self.latest):
+            self.latest_ts = os.path.getmtime(self.latest)
+
+    def consider(self, frame_path, sig):
+        """Score a new frame against baseline; promote it if novel."""
+        now = time.time()
+        with self.lock:
+            self.captures += 1
+            self.latest_ts = now
+            if sig is None:
+                return
+            if self.baseline is None:
+                self.baseline = [float(b) for b in sig]
+                self._save_baseline()
+                return
+            score = sum(abs(a - b) for a, b in zip(sig, self.baseline)) / len(sig)
+            self.last_score = round(score, 2)
+            if score >= NOVELTY_THRESHOLD:
+                # Novel: this frame is the new reference. The baseline
+                # does NOT chase it - novelty stays the priority.
+                with open(frame_path, "rb") as f:
+                    data = f.read()
+                tmp = self.reference + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, self.reference)
+                self.reference_ts = now
+                self.novel_count += 1
+                self.events.append({"ts": now, "score": round(score, 2)})
+                self.events = self.events[-20:]
+            else:
+                # Ordinary frame: let the baseline drift slowly toward
+                # the settled scene so slow changes (dusk, seasons)
+                # become the new normal instead of permanent novelty.
+                a = 0.05
+                self.baseline = [b + a * (s - b) for b, s in zip(self.baseline, sig)]
+                self._save_baseline()
+
+    def _save_baseline(self):
+        raw = bytes(max(0, min(255, round(v))) for v in self.baseline)
+        tmp = self.baseline_file + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        os.replace(tmp, self.baseline_file)
+
+    def status(self):
+        now = time.time()
+        with self.lock:
+            return {
+                "captures": self.captures,
+                "novel_count": self.novel_count,
+                "last_score": self.last_score,
+                "threshold": NOVELTY_THRESHOLD,
+                "baseline_ready": self.baseline is not None,
+                "latest_ts": self.latest_ts or None,
+                "latest_age_s": round(now - self.latest_ts, 1) if self.latest_ts else None,
+                "reference_ts": self.reference_ts or None,
+                "reference_age_s": round(now - self.reference_ts, 1) if self.reference_ts else None,
+                "recent_novel_events": self.events[-5:],
+            }
+
+
+CACHE = FrameCache()
+
+
+def cache_loop():
+    """Capture forever: latest frame into the cache, novelty scored."""
+    while True:
+        try:
+            with LOCK, tempfile.TemporaryDirectory() as td:
+                frame = os.path.join(td, "frame.jpg")
+                if capture_raw(frame, res=CACHE_RES, skip=CACHE_SKIP):
+                    tmp = CACHE.latest + ".tmp"
+                    with open(frame, "rb") as f:
+                        data = f.read()
+                    with open(tmp, "wb") as f:
+                        f.write(data)
+                    os.replace(tmp, CACHE.latest)
+                    CACHE.consider(CACHE.latest, signature(CACHE.latest))
+        except Exception as e:
+            print(f"cache loop: {e}", file=sys.stderr, flush=True)
+        time.sleep(CACHE_SECONDS)
+
+
 def registry():
     for p in (os.path.join(HERE, "cameras.json"), "/etc/skysong/cameras.json"):
         if os.path.exists(p):
@@ -117,54 +255,143 @@ def registry():
     return []
 
 
-PAGE = """<!doctype html><meta charset=utf-8><title>{title}</title>
-<style>body{{font-family:system-ui;background:#111;color:#eee;margin:2rem}}
-img{{max-width:100%;background:#000}}input[type=range]{{width:220px}}
-.row{{margin:.4rem 0}}button{{padding:.4rem 1rem}}</style>
-<h1>{title}</h1>
-<p>{node} &middot; {device} &middot; <a href="/grid" style="color:#8cf">grid of all cameras</a></p>
-<img id=view src="/snapshot.jpg" alt="camera view">
-<div class=row>
- <button onclick="snap()">Snapshot</button>
- <button onclick="clip()">Record 10s MP4</button>
- <span id=msg></span></div>
-<h3>Pan / tilt / zoom (camera)</h3>
-<div class=row>Pan <input type=range id=pan min=-36 max=36 step=1 value=0 oninput="ptz()"> <span id=panv>0&deg;</span></div>
-<div class=row>Tilt <input type=range id=tilt min=-36 max=36 step=1 value=0 oninput="ptz()"> <span id=tiltv>0&deg;</span></div>
-<div class=row>Zoom <input type=range id=zoom min=100 max=500 step=5 value=100 oninput="ptz()"> <span id=zoomv>1.0&times;</span></div>
-<h3>Effects (applied to snapshot / clip)</h3>
-<div class=row>Brightness <input type=range id=b min=-0.5 max=0.5 step=0.02 value=0></div>
-<div class=row>Contrast <input type=range id=c min=0.4 max=1.8 step=0.02 value=1></div>
-<div class=row>Gamma <input type=range id=g min=0.4 max=2.5 step=0.05 value=1></div>
-<div class=row>Levels in <input type=range id=il min=0 max=0.6 step=0.01 value=0> &hellip; <input type=range id=ih min=0.4 max=1 step=0.01 value=1></div>
+CSS = """
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0b0e13;color:#e8ecf1;
+ margin:0;padding:1.2rem 1.4rem 2.5rem;max-width:1180px;margin-inline:auto}
+a{color:#7cc4ff}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:.6rem 1rem;margin-bottom:1rem}
+h1{font-size:1.35rem;margin:0}
+.sub{color:#9aa7b5;font-size:.9rem}
+.pill{font-size:.75rem;font-weight:600;padding:.18rem .6rem;border-radius:999px;
+ background:#17351f;color:#7de08d;border:1px solid #2c5c37}
+.pill.stale{background:#3a2b12;color:#f2c14e;border-color:#6b5518}
+.pill.novel{background:#3d1530;color:#ff9ad5;border-color:#7a2c5e}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:820px){.grid2{grid-template-columns:1fr}}
+.card{background:#12161d;border:1px solid #232b36;border-radius:12px;padding:.9rem}
+.card h2{font-size:.95rem;margin:.1rem 0 .5rem;color:#c8d3df}
+.card img{width:100%;border-radius:8px;background:#000;display:block}
+.cap{color:#9aa7b5;font-size:.82rem;margin-top:.45rem}
+.cap b{color:#e8ecf1}
+button{background:#1d6fd1;color:#fff;border:0;border-radius:8px;padding:.5rem 1rem;
+ font-size:.9rem;cursor:pointer}
+button:hover{background:#2a80e4}
+button.ghost{background:#1a222d;color:#c8d3df;border:1px solid #2b3644}
+.row{display:flex;align-items:center;gap:.7rem;margin:.45rem 0;flex-wrap:wrap}
+.row label{width:110px;color:#9aa7b5;font-size:.85rem}
+input[type=range]{flex:1;min-width:140px}
+.val{width:52px;text-align:right;font-variant-numeric:tabular-nums;font-size:.85rem}
+.controls{margin-top:1rem}
+h3{font-size:.9rem;color:#c8d3df;margin:1rem 0 .3rem}
+#msg{color:#9aa7b5;font-size:.85rem}
+"""
+
+PAGE = """<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>{title} - camera</title><style>{css}</style>
+<header>
+ <h1>{title}</h1><span class=sub>{node} &middot; {device}</span>
+ <span class=pill id=livepill>connecting</span>
+ <span class=pill novel id=novelpill style="display:none"></span>
+ <span class=sub style="margin-left:auto"><a href="/grid">grid of all cameras</a></span>
+</header>
+<div class=grid2>
+ <div class=card>
+  <h2>Most recent change (reference image)</h2>
+  <img id=ref src="/reference.jpg" alt="most recent novel frame">
+  <div class=cap id=refcap>waiting for the first novel frame&hellip;</div>
+ </div>
+ <div class=card>
+  <h2>Latest frame (cached, refreshes automatically)</h2>
+  <img id=view src="/snapshot.jpg" alt="latest cached frame">
+  <div class=cap id=viewcap>&hellip;</div>
+ </div>
+</div>
+<div class="card controls">
+ <div class=row>
+  <button onclick="fresh()">Fresh snapshot (live capture)</button>
+  <button class=ghost onclick="clip()">Record 10s MP4</button>
+  <span id=msg></span>
+ </div>
+ <h3>Pan / tilt / zoom (camera)</h3>
+ <div class=row><label>Pan</label><input type=range id=pan min=-36 max=36 step=1 value=0 oninput="ptz()"><span class=val id=panv>0&deg;</span></div>
+ <div class=row><label>Tilt</label><input type=range id=tilt min=-36 max=36 step=1 value=0 oninput="ptz()"><span class=val id=tiltv>0&deg;</span></div>
+ <div class=row><label>Zoom</label><input type=range id=zoom min=100 max=500 step=5 value=100 oninput="ptz()"><span class=val id=zoomv>1.0&times;</span></div>
+ <h3>Effects (applied to the served frame, never to the camera)</h3>
+ <div class=row><label>Brightness</label><input type=range id=b min=-0.5 max=0.5 step=0.02 value=0 oninput="snap()"></div>
+ <div class=row><label>Contrast</label><input type=range id=c min=0.4 max=1.8 step=0.02 value=1 oninput="snap()"></div>
+ <div class=row><label>Gamma</label><input type=range id=g min=0.4 max=2.5 step=0.05 value=1 oninput="snap()"></div>
+ <div class=row><label>Levels in</label><input type=range id=il min=0 max=0.6 step=0.01 value=0 oninput="snap()"> <input type=range id=ih min=0.4 max=1 step=0.01 value=1 oninput="snap()"></div>
+</div>
 <script>
 const $=id=>document.getElementById(id);
+const fmtT=ts=>ts?new Date(ts*1000).toLocaleTimeString():'-';
+const fmtAge=s=>s==null?'-':(s<90?Math.round(s)+'s ago':Math.round(s/60)+'m ago');
 function fx(){{const p=new URLSearchParams();
  if($('b').value!=0)p.set('b',$('b').value); if($('c').value!=1)p.set('c',$('c').value);
  if($('g').value!=1)p.set('g',$('g').value);
  if($('il').value!=0)p.set('il',$('il').value); if($('ih').value!=1)p.set('ih',$('ih').value);
  return p.toString();}}
 function snap(){{$('view').src='/snapshot.jpg?'+fx()+'&t='+Date.now();}}
+function fresh(){{$('msg').textContent='capturing...';
+ const img=new Image();
+ img.onload=()=>{{$('view').src=img.src;$('msg').textContent='fresh frame loaded';}};
+ img.src='/snapshot.jpg?fresh=1&'+fx()+'&t='+Date.now();}}
 function clip(){{$('msg').textContent='recording...';
  fetch('/clip.mp4?seconds=10&'+fx()).then(r=>r.blob()).then(b=>{{
   const a=document.createElement('a');a.href=URL.createObjectURL(b);
   a.download='clip.mp4';a.click();$('msg').textContent='clip downloaded';}});}}
 let ptzTimer;
-function ptz(){{$('panv').textContent=$('pan').value+'\u00B0';$('tiltv').textContent=$('tilt').value+'\u00B0';
- $('zoomv').textContent=($('zoom').value/100).toFixed(1)+'\u00D7';
+function ptz(){{$('panv').textContent=$('pan').value+'\\u00B0';$('tiltv').textContent=$('tilt').value+'\\u00B0';
+ $('zoomv').textContent=($('zoom').value/100).toFixed(1)+'\\u00D7';
  clearTimeout(ptzTimer);ptzTimer=setTimeout(()=>fetch('/api/ptz',{{method:'POST',
  headers:{{'Content-Type':'application/json'}},body:JSON.stringify(
  {{pan_deg:+$('pan').value,tilt_deg:+$('tilt').value,zoom:+$('zoom').value}})}}),150);}}
+let lastRefTs=0;
+async function tick(){{
+ try{{
+  const s=await (await fetch('/api/status')).json();
+  const live=s.latest_age_s!=null&&s.latest_age_s<45;
+  $('livepill').textContent=live?('live - frame '+fmtAge(s.latest_age_s)):('stale - frame '+fmtAge(s.latest_age_s));
+  $('livepill').className='pill'+(live?'':' stale');
+  $('viewcap').innerHTML='captured <b>'+fmtT(s.latest_ts)+'</b> &middot; change score <b>'+
+    (s.last_score==null?'-':s.last_score)+'</b> / '+s.threshold+' &middot; '+s.captures+' frames cached';
+  if(s.reference_ts){{
+   $('novelpill').style.display='';
+   $('novelpill').textContent='last change '+fmtAge(s.reference_age_s);
+   $('refcap').innerHTML='captured <b>'+fmtT(s.reference_ts)+'</b> &middot; '+
+     fmtAge(s.reference_age_s)+' &middot; '+s.novel_count+' novel frames so far';
+   if(s.reference_ts!==lastRefTs){{lastRefTs=s.reference_ts;
+     $('ref').src='/reference.jpg?t='+Date.now();}}
+  }}
+ }}catch(e){{ $('livepill').textContent='agent unreachable'; $('livepill').className='pill stale'; }}
+ snap();
+}}
+setInterval(tick,5000); tick();
 </script>"""
 
-GRID = """<!doctype html><meta charset=utf-8><title>Skysong cameras</title>
-<style>body{{font-family:system-ui;background:#111;color:#eee;margin:2rem}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:1rem}}
-.tile img{{width:100%;background:#000}}.tile a{{color:#8cf}}</style>
-<h1>Skysong &mdash; camera portals</h1>
-<div class=grid>{tiles}</div>
-<script>setInterval(()=>document.querySelectorAll('img').forEach(i=>{{
- const u=new URL(i.src);u.searchParams.set('t',Date.now());i.src=u;}}),15000);</script>"""
+GRID = """<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Camera grid</title><style>{css}
+.tiles{{display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:1rem}}
+.tile img{{width:100%;border-radius:8px;background:#000;display:block}}
+.tile h2 a{{color:#e8ecf1;text-decoration:none}}
+</style>
+<header><h1>Camera grid</h1><span class=sub>every registered camera, one portal each</span></header>
+<div class=tiles>{tiles}</div>
+<script>
+async function tileStatus(el,base){{
+ try{{const s=await (await fetch(base+'/api/status')).json();
+  el.textContent='frame '+(s.latest_age_s==null?'-':Math.round(s.latest_age_s)+'s old')+
+   ' - last change '+(s.reference_ts?new Date(s.reference_ts*1000).toLocaleTimeString():'none yet');
+ }}catch(e){{el.textContent='status unreachable';}}}}
+document.querySelectorAll('.tile').forEach(t=>tileStatus(t.querySelector('.st'),t.dataset.base));
+setInterval(()=>document.querySelectorAll('.tile img').forEach(i=>{{
+ const u=new URL(i.src);u.searchParams.set('t',Date.now());i.src=u;}}),15000);
+setInterval(()=>document.querySelectorAll('.tile').forEach(t=>tileStatus(t.querySelector('.st'),t.dataset.base)),30000);
+</script>"""
 
 
 class H(BaseHTTPRequestHandler):
@@ -174,34 +401,44 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
     def send_json(self, obj, code=200):
         self.send_bytes(json.dumps(obj).encode(), "application/json", code)
 
+    def send_file(self, path, ctype):
+        with open(path, "rb") as f:
+            self.send_bytes(f.read(), ctype)
+
     def do_GET(self):
         u = urlparse(self.path); q = parse_qs(u.query)
         try:
             if u.path == "/":
-                html = PAGE.format(title=camera_name(),
+                html = PAGE.format(css=CSS, title=camera_name(),
                                    node=os.uname().nodename, device=DEVICE)
                 self.send_bytes(html.encode(), "text/html; charset=utf-8")
             elif u.path == "/grid":
                 tiles = "".join(
-                    f'<div class=tile><h3>{c["name"]}</h3>'
+                    f'<div class="card tile" data-base="{c["url"]}">'
+                    f'<h2><a href="{c["url"]}/">{c["name"]}</a></h2>'
                     f'<a href="{c["url"]}/"><img src="{c["url"]}/snapshot.jpg"></a>'
-                    f'<p><a href="{c["url"]}/">open portal</a></p></div>'
+                    f'<div class="cap st">checking&hellip;</div></div>'
                     for c in registry())
-                self.send_bytes(GRID.format(tiles=tiles or "<p>No cameras registered.</p>").encode(),
+                self.send_bytes(GRID.format(css=CSS, tiles=tiles or "<p>No cameras registered.</p>").encode(),
                                 "text/html; charset=utf-8")
             elif u.path == "/api/info":
                 self.send_json({"node": os.uname().nodename, "device": DEVICE,
                                 "camera": camera_name()})
+            elif u.path == "/api/status":
+                self.send_json(CACHE.status())
             elif u.path == "/api/controls":
                 self.send_json(get_ctrls(list(PTZ) + SENSOR))
             elif u.path == "/snapshot.jpg":
                 self.snapshot(q)
+            elif u.path == "/reference.jpg":
+                self.reference(q)
             elif u.path == "/clip.mp4":
                 self.clip(q)
             else:
@@ -229,16 +466,32 @@ class H(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "not found"}, 404)
 
-    def snapshot(self, q):
-        with LOCK, tempfile.TemporaryDirectory() as td:
-            raw, out = os.path.join(td, "raw.jpg"), os.path.join(td, "out.jpg")
-            if not capture_raw(raw):
-                return self.send_json({"error": "capture failed"}, 500)
-            vf = fx_filter(q)
-            if vf and not apply_fx(raw, out, vf):
+    def _serve_frame(self, src_path, q):
+        vf = fx_filter(q)
+        if not vf:
+            return self.send_file(src_path, "image/jpeg")
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "out.jpg")
+            if not apply_fx(src_path, out, vf):
                 return self.send_json({"error": "effects failed"}, 500)
-            with open(out if vf else raw, "rb") as f:
-                self.send_bytes(f.read(), "image/jpeg")
+            self.send_file(out, "image/jpeg")
+
+    def snapshot(self, q):
+        if q.get("fresh", ["0"])[0] == "1":
+            with LOCK, tempfile.TemporaryDirectory() as td:
+                raw = os.path.join(td, "raw.jpg")
+                if not capture_raw(raw):
+                    return self.send_json({"error": "capture failed"}, 500)
+                return self._serve_frame(raw, q)
+        if not os.path.exists(CACHE.latest):
+            return self.send_json({"error": "cache not warm yet"}, 503)
+        self._serve_frame(CACHE.latest, q)
+
+    def reference(self, q):
+        path = CACHE.reference if os.path.exists(CACHE.reference) else CACHE.latest
+        if not os.path.exists(path):
+            return self.send_json({"error": "no frames yet"}, 503)
+        self._serve_frame(path, q)
 
     def clip(self, q):
         secs = max(1, min(120, int(q.get("seconds", [10])[0])))
@@ -270,6 +523,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8642)
     args = ap.parse_args()
+    threading.Thread(target=cache_loop, daemon=True).start()
     hosts = ["127.0.0.1"]
     ts = tailscale_ip()
     if ts: hosts.append(ts)
@@ -278,7 +532,8 @@ def main():
         srv = ThreadingHTTPServer((h, args.port), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         servers.append(srv)
-        print(f"skysong-agent on http://{h}:{args.port} device={DEVICE}", flush=True)
+        print(f"skysong-agent v2 on http://{h}:{args.port} device={DEVICE} "
+              f"cache={CACHE_SECONDS}s threshold={NOVELTY_THRESHOLD}", flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
