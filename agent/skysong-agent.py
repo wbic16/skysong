@@ -325,6 +325,7 @@ PAGE = """<!doctype html><meta charset=utf-8>
   <button class=preset data-preset=dusk onclick="applyPreset('dusk')">Dusk</button>
   <button class=preset data-preset=llama onclick="applyPreset('llama')">&#129433; Llama Search</button>
   <span style="flex:1"></span>
+  <button class=ghost onclick="resetView()">Reset view</button>
   <button onclick="fresh()">Fresh snapshot</button>
   <button class=ghost onclick="clip()">Record 10s MP4</button>
   <span id=msg></span>
@@ -381,6 +382,14 @@ function applyPreset(name){{const p=PRESETS[name];if(!p)return;
  $('il').value=p.il;$('ih').value=p.ih;
  document.querySelectorAll('button.preset').forEach(x=>x.classList.toggle('active',x.dataset.preset===name));
  snap();}}
+function resetView(){{
+ $('b').value=0;$('c').value=1;$('g').value=1;$('sat').value=1;$('il').value=0;$('ih').value=1;
+ document.querySelectorAll('button.preset').forEach(x=>x.classList.remove('active'));
+ $('pan').value=0;$('tilt').value=0;$('zoom').value=100;
+ $('panv').textContent='0\u00B0';$('tiltv').textContent='0\u00B0';$('zoomv').textContent='1.0\u00D7';
+ fetch('/api/ptz',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+  body:JSON.stringify({{pan_deg:0,tilt_deg:0,zoom:100}})}});
+ $('msg').textContent='view reset'; snap();}}
 function showTab(which){{const adv=which==='adv';
  $('tab-adv').style.display=adv?'':'none';
  $('tabbtn-view').classList.toggle('active',!adv);
