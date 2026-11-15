@@ -16,15 +16,19 @@ already on hand.
   Exactly one camera exists on the fleet: a **Logitech BRIO** (USB, 4K)
   attached to **ni-knight**, a box in the basement bedroom.
 - `tools/snap.sh` captured a 3840×2160 still from it; the frame is at
-  `docs/first-light-2026-11-15.jpg`. It shows the basement stairwell in
-  near-darkness — the room lights were off.
+  `docs/first-light-2026-11-15.jpg`. The room lights were off; the frame
+  is near-black, and the points of light in it are the status LEDs of the
+  other ranch nodes that share the room. (An early reading of the
+  brightened frame claimed stairs and a block wall — there are no stairs
+  in that room. That was pattern-matching on noise, corrected by Will
+  2026-11-15.)
 
 Lessons, learned the honest way:
 
 1. **Exposure warm-up is not optional.** Skipping 30 frames (~1.5 s) gave a
    near-black frame with only LEDs visible. Skipping 200 frames (~10 s)
-   let the auto-exposure settle and the scene (stairs, block wall) became
-   readable after brightening. `snap.sh` defaults to 200.
+   let the auto-exposure settle; the node lights became clean points
+   instead of smears. `snap.sh` defaults to 200.
 2. **A webcam is not a pasture camera.** The BRIO has no infrared and no
    spotlight; in a dark room it is nearly blind. Fine for prototyping the
    pipeline — the pasture design's cameras carry their own IR for this
